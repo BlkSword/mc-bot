@@ -1,6 +1,6 @@
 # Minecraft Bot
 
-一个基于 Python 的多功能机器人，专为 Minecraft 服务器设计，通过和NapCat和MCSM协同，使其能够完成各项任务。
+一个支持NapCat的MC机器人框架，专为 Minecraft 服务器设计，通过和主流启动器MCSM协同，使其能够完成各项任务。
 
 ## 功能特性
 
