@@ -296,7 +296,7 @@ async def memory_refresh_task():
     while True:
         try:
             # 每小时执行一次记忆刷新
-            await asyncio.sleep(86400)  # 1天
+            await asyncio.sleep(3600)  # 1小时
             
             # 获取所有用户ID（通过短期记忆文件名）
             user_ids = set()
