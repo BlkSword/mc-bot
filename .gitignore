@@ -209,3 +209,5 @@ __marimo__/
 config/
 
 memory/
+
+events_storage.json

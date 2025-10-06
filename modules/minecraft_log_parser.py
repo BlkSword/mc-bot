@@ -3,12 +3,9 @@ import logging
 import re
 from datetime import datetime
 from typing import Dict
+from modules.persistent_events_storage import get_processed_events, add_processed_event, cleanup_expired_events
 
 logger = logging.getLogger(__name__)
-
-# 存储已处理过的玩家事件，避免重复通知
-# 修改为字典，键为事件标识符，值为事件处理的时间戳
-processed_events = {}
 
 
 async def parse_minecraft_logs(config: Dict):
@@ -22,6 +19,10 @@ async def parse_minecraft_logs(config: Dict):
     from modules.file_api_handler import get_http_client, FILE_DEFAULT_DAEMON_ID, FILE_DEFAULT_UUID
     from modules.websocket_manager import send_message
     
+    # 获取已处理的事件列表
+    global processed_events
+    processed_events = get_processed_events()
+    
     http_client = await get_http_client()
     FILE_API_BASE_URL = config.get('file_api', {}).get('base_url', '')
     FILE_API_KEY = config.get('file_api', {}).get('api_key', '')
@@ -29,11 +30,14 @@ async def parse_minecraft_logs(config: Dict):
     # 等待应用启动完成
     await asyncio.sleep(5)
     
-    last_position = 0
+    last_position = -1
     server_started = False
     
     while True:
         try:
+            # 更新已处理事件列表
+            processed_events = get_processed_events()
+            
             logger.info("开始获取Minecraft日志文件...")
             # 调用API获取日志内容
             params = {
@@ -73,14 +77,26 @@ async def parse_minecraft_logs(config: Dict):
                     lines = log_content.split("\n")
                     logger.info(f"成功获取日志内容，共 {len(lines)} 行")
                     
+                    if last_position == -1:
+                        last_position = len(lines)
+                        logger.info(f"初始化日志位置: {last_position}，将只处理之后的日志")
+                        continue  # 跳过本次循环，下次再处理新日志
+                    
                     # 检查服务器是否已启动完成
                     if not server_started:
                         logger.info("检查服务器是否已启动完成...")
                         for line in lines:
-                            if 'Done (' in line and 'For help, type "help"' in line:
+                            # 修复服务器启动检测逻辑，支持更多日志格式
+                            if 'Done (' in line and ('For help, type "help"' in line or "For help, type 'help'" in line):
                                 logger.info("检测到服务器启动完成")
                                 server_started = True
                                 # 记录当前日志位置，只处理之后的新事件
+                                last_position = len(lines)
+                                break
+                            # 添加额外的服务器启动检测方式
+                            if re.search(r'\[Server thread/INFO\].*Done .* Took .*,* seconds', line):
+                                logger.info("检测到服务器启动完成（备用方式）")
+                                server_started = True
                                 last_position = len(lines)
                                 break
                     
@@ -100,18 +116,26 @@ async def parse_minecraft_logs(config: Dict):
                         logger.info(f"日志处理完成，新增 {new_lines_count} 行日志")
                     else:
                         logger.info("服务器尚未启动完成，等待中...")
+                        new_lines_count = 0
+                        for i in range(last_position, len(lines)):
+                            line = lines[i]
+                            if line.strip():  # 只处理非空行
+                                await process_log_line(line, config)
+                                new_lines_count += 1
+                        last_position = len(lines)
+                        logger.info(f"处理了 {new_lines_count} 行日志")
                 else:
                     logger.warning("获取到的日志内容为空")
             else:
                 logger.error(f"获取日志HTTP错误: {response.status_code}")
             
-            # 等待1分钟再检查
-            logger.info("等待60秒后再次检查日志...")
-            await asyncio.sleep(60)
+            # 等待10秒再检查
+            logger.info("等待10秒后再次检查日志...")
+            await asyncio.sleep(10)
             
         except Exception as e:
             logger.error(f"解析Minecraft日志时出错: {e}", exc_info=True)
-            await asyncio.sleep(60)
+            await asyncio.sleep(10)
 
 
 async def process_log_line(line: str, config: Dict):
@@ -124,98 +148,86 @@ async def process_log_line(line: str, config: Dict):
     """
     from .websocket_manager import send_message
     
-    logger.info(f"处理日志行: {line}")
+    logger.debug(f"处理日志行: {line}")
     current_time = datetime.now()
     
     # 检测玩家加入游戏
-    join_match = re.search(r'\[Server thread/INFO\] \[net\.minecraft\.server\.MinecraftServer/\]: (.+) joined the game', line)
-    if join_match:
-        player_name = join_match.group(1)
-        event_key = f"join:{player_name}"
-        logger.info(f"检测到玩家加入游戏事件: {player_name}")
-        
-        # 检查事件是否已处理且在短时间内（避免重复通知）
-        should_process = True
-        if event_key in processed_events:
-            last_processed_time = processed_events[event_key]
-            # 如果在5分钟内已经处理过相同事件，则跳过
-            if (current_time - last_processed_time).total_seconds() < 300:
-                should_process = False
-                logger.info(f"事件 {event_key} 在5分钟内已处理过，跳过通知")
-        
-        if should_process:
-            processed_events[event_key] = current_time
-            # 清理过期的事件记录（超过1小时的记录）
-            expired_keys = []
-            for key, timestamp in processed_events.items():
-                if (current_time - timestamp).total_seconds() > 3600:
-                    expired_keys.append(key)
-            for key in expired_keys:
-                del processed_events[key]
-            
-            logger.info(f"玩家 {player_name} 加入游戏")
-            # 发送欢迎消息到群聊（需要在配置中指定群号）
-            group_id = config.get("server_group_id", "")  # 需要在配置中添加
-            if group_id:
-                message_data = {
-                    "action": "send_group_msg",
-                    "params": {
-                        "group_id": group_id,
-                        "message": f"欢迎 {player_name} 加入游戏！"
-                    }
-                }
-                await send_message(message_data)
-                logger.info(f"已发送欢迎消息到群聊 {group_id}")
+    # 支持多种日志格式
+    join_patterns = [
+        r'\[Server thread/INFO\] \[net\.minecraft\.server\.MinecraftServer/\]: (.+) joined the game',
+        r'\[Server thread/INFO\] \[minecraft/MinecraftServer\]: (.+) joined the game',
+        r'\[Server thread/INFO\]: (.+) joined the game',
+        r'(.+) joined the game'
+    ]
     
-    # 检测玩家离开游戏
-    leave_match = re.search(r'\[Server thread/INFO\] \[net\.minecraft\.server\.MinecraftServer/\]: (.+) left the game', line)
-    if leave_match:
-        player_name = leave_match.group(1)
-        event_key = f"leave:{player_name}"
-        logger.info(f"检测到玩家离开游戏事件: {player_name}")
-        
-        # 检查事件是否已处理且在短时间内（避免重复通知）
-        should_process = True
-        if event_key in processed_events:
-            last_processed_time = processed_events[event_key]
-            # 如果在5分钟内已经处理过相同事件，则跳过
-            if (current_time - last_processed_time).total_seconds() < 300:
-                should_process = False
-                logger.info(f"事件 {event_key} 在5分钟内已处理过，跳过通知")
-        
-        if should_process:
-            processed_events[event_key] = current_time
-            # 清理过期的事件记录（超过1小时的记录）
-            expired_keys = []
-            for key, timestamp in processed_events.items():
-                if (current_time - timestamp).total_seconds() > 3600:
-                    expired_keys.append(key)
-            for key in expired_keys:
-                del processed_events[key]
-            
-            logger.info(f"玩家 {player_name} 离开游戏")
-            # 发送告别消息到群聊（需要在配置中指定群号）
-            group_id = config.get("server_group_id", "")  # 需要在配置中添加
-            if group_id:
-                message_data = {
-                    "action": "send_group_msg",
-                    "params": {
-                        "group_id": group_id,
-                        "message": f"{player_name} 离开了游戏，再见！"
-                    }
-                }
-                await send_message(message_data)
-                logger.info(f"已发送告别消息到群聊 {group_id}")
+    player_name = None
+    event_type = None
     
-    # 检测玩家断开连接 (Disconnected)
-    disconnect_match = re.search(r'\[Server thread/INFO\] \[net\.minecraft\.server\.network\.ServerGamePacketListenerImpl/\]: (.+) lost connection: Disconnected', line)
-    if disconnect_match:
-        player_name = disconnect_match.group(1)
-        event_key = f"disconnect:{player_name}"
-        logger.info(f"检测到玩家断开连接事件: {player_name}")
+    for pattern in join_patterns:
+        join_match = re.search(pattern, line)
+        if join_match:
+            player_name = join_match.group(1).strip()  # 添加.strip()去除可能的空白字符
+            event_type = "join"
+            logger.info(f"检测到玩家加入游戏事件: {player_name} (使用模式: {pattern})")
+            break
+    
+    if not player_name:
+        # 检测玩家登录事件（在加入游戏之前）
+        login_patterns = [
+            r'\[Server thread/INFO\] \[minecraft/PlayerList\]: (.+)\[/.+\] logged in with entity id .+'
+        ]
+        
+        for pattern in login_patterns:
+            login_match = re.search(pattern, line)
+            if login_match:
+                player_name = login_match.group(1).strip()  # 添加.strip()去除可能的空白字符
+                event_type = "login"
+                logger.info(f"检测到玩家登录事件: {player_name} (使用模式: {pattern})")
+                break
+    
+    if not player_name:
+        # 检测玩家离开游戏
+        leave_patterns = [
+            r'\[Server thread/INFO\] \[net\.minecraft\.server\.MinecraftServer/\]: (.+) left the game',
+            r'\[Server thread/INFO\] \[minecraft/MinecraftServer\]: (.+) left the game',
+            r'\[Server thread/INFO\]: (.+) left the game',
+            r'(.+) left the game'
+        ]
+        
+        for pattern in leave_patterns:
+            leave_match = re.search(pattern, line)
+            if leave_match:
+                player_name = leave_match.group(1).strip()  # 添加.strip()去除可能的空白字符
+                event_type = "leave"
+                logger.info(f"检测到玩家离开游戏事件: {player_name} (使用模式: {pattern})")
+                break
+    
+    if not player_name:
+        # 检测玩家断开连接
+        disconnect_patterns = [
+            r'\[Server thread/INFO\] \[net\.minecraft\.server\.network\.ServerGamePacketListenerImpl/\]: (.+) lost connection: Disconnected',
+            r'\[Server thread/INFO\] \[minecraft\.server\.network\.ServerGamePacketListenerImpl/\]: (.+) lost connection: Disconnected',
+            r'\[Server thread/INFO\]: (.+) lost connection: Disconnected',
+            r'(.+) lost connection: Disconnected',
+            r'\[Server thread/INFO\] \[minecraft/ServerLoginPacketListenerImpl\]: com\.mojang\.authlib\.GameProfile@.+?\[id=.+?,name=(.+?),properties=.+?\] \(.+\) lost connection: Disconnected'
+        ]
+        
+        for pattern in disconnect_patterns:
+            disconnect_match = re.search(pattern, line)
+            if disconnect_match:
+                player_name = disconnect_match.group(1).strip()  # 添加.strip()去除可能的空白字符
+                event_type = "disconnect"
+                logger.info(f"检测到玩家断开连接事件: {player_name} (使用模式: {pattern})")
+                break
+    
+    # 如果检测到玩家事件
+    if player_name and event_type:
+        # 使用更精确的事件键，包含事件类型和日志行内容
+        event_key = f"{event_type}:{player_name}"
         
         # 检查事件是否已处理且在短时间内（避免重复通知）
         should_process = True
+        global processed_events
         if event_key in processed_events:
             last_processed_time = processed_events[event_key]
             # 如果在5分钟内已经处理过相同事件，则跳过
@@ -224,25 +236,43 @@ async def process_log_line(line: str, config: Dict):
                 logger.info(f"事件 {event_key} 在5分钟内已处理过，跳过通知")
         
         if should_process:
-            processed_events[event_key] = current_time
-            # 清理过期的事件记录（超过1小时的记录）
-            expired_keys = []
-            for key, timestamp in processed_events.items():
-                if (current_time - timestamp).total_seconds() > 3600:
-                    expired_keys.append(key)
-            for key in expired_keys:
-                del processed_events[key]
+            # 添加事件到持久化存储
+            add_processed_event(event_key, current_time)
+            # 重新获取处理过的事件列表（可能已更新）
+            processed_events = get_processed_events()
             
-            logger.info(f"玩家 {player_name} 断开连接")
-            # 发送告别消息到群聊（需要在配置中指定群号）
+            # 清理过期的事件记录（超过1小时的记录）
+            cleanup_expired_events()
+            
+            # 发送消息到群聊（需要在配置中指定群号）
             group_id = config.get("server_group_id", "")  # 需要在配置中添加
             if group_id:
-                message_data = {
-                    "action": "send_group_msg",
-                    "params": {
-                        "group_id": group_id,
-                        "message": f"{player_name} 断开了连接，再见！"
-                    }
-                }
-                await send_message(message_data)
-                logger.info(f"已发送断开连接消息到群聊 {group_id}")
+                message = ""
+                if event_type == "join":
+                    message = f"欢迎 {player_name} 加入游戏！"
+                elif event_type == "login":
+                    message = f"玩家 {player_name} 正在登录游戏..."
+                elif event_type == "leave":
+                    message = f"{player_name} 离开了游戏，再见！"
+                elif event_type == "disconnect":
+                    message = f"{player_name} 断开了连接，再见！"
+                
+                if message:
+                    try:
+                        message_data = {
+                            "action": "send_group_msg",
+                            "params": {
+                                "group_id": group_id,
+                                "message": message
+                            }
+                        }
+                        await send_message(message_data)
+                        logger.info(f"已发送{event_type}消息到群聊 {group_id}: {message}")
+                    except Exception as e:
+                        logger.error(f"发送消息到群聊时出错: {e}", exc_info=True)
+            else:
+                logger.warning(f"检测到玩家{event_type}事件但未配置server_group_id，无法发送通知")
+        else:
+            logger.info(f"跳过处理事件: {event_type}:{player_name}")
+    else:
+        logger.debug(f"未匹配到任何玩家事件: {line}")
